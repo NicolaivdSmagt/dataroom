@@ -42,11 +42,19 @@ Endpoint env reference (remote):
 | --- | --- |
 | `LLM_BASE_URL` | Full base URL incl. `/v1`. Setting it selects remote mode. |
 | `LLM_API_KEY` | Bearer token for the endpoint. |
-| `MODEL_ID` | Provider's model name (e.g. `deepseek-ai/DeepSeek-R1-0528`, `openai.gpt-oss-120b`). |
+| `MODEL_ID` | Provider's model name (e.g. `deepseek-ai/DeepSeek-R1-0528`, `openai.gpt-oss-120b`). For a [LiteLLM proxy](https://docs.litellm.ai/docs/simple_proxy) this is the `model_name` ALIAS from its `config.yaml` (LiteLLM routes on that), not the upstream provider's raw id. |
 | `CONTEXT_WINDOW` | Served model's context length; compaction + dashboard denominator (no `/slots` in remote mode). |
 | `LLM_API` | `openai-completions` (default) or `openai-responses` (Bedrock Mantle). |
 | `LLM_THINKING_LEVEL` | `high` (default) / `medium` / `off`. |
-| `LLM_SUPPORTS_DEVELOPER_ROLE`, `LLM_SUPPORTS_REASONING_EFFORT` | `false` default; `true` for models that support them. |
+| `LLM_SUPPORTS_DEVELOPER_ROLE`, `LLM_SUPPORTS_REASONING_EFFORT` | `false` default; `true` for models that support them (e.g. a LiteLLM proxy fronting OpenAI o-series / GPT). |
+
+LiteLLM proxy preset (defaults to port 4000):
+```bash
+LLM_BASE_URL=http://your-litellm-host:4000/v1
+LLM_API_KEY=sk-your_litellm_virtual_or_master_key
+MODEL_ID=your_model_name   # the model_name alias from LiteLLM's config.yaml
+CONTEXT_WINDOW=131072       # the fronted model's context length
+```
 
 In remote mode the dashboard's KV-occupancy + tok/s charts are unavailable (those read llama.cpp
 `/slots` and `/metrics`); context utilization falls back to Pi's usage tokens vs `CONTEXT_WINDOW`.

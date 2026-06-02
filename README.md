@@ -88,7 +88,7 @@ Either way, when it finishes it prints the API URL.
 
 Prereqs (default remote mode):
 - A Docker host. **No GPU required** - the app's v5-nano embedder runs on CPU (`EMBED_DEVICE=cpu`).
-- A remote OpenAI-compatible LLM endpoint and key (`LLM_BASE_URL` + `LLM_API_KEY` + `MODEL_ID`). Tested presets: [Nebius Token Factory](https://docs.tokenfactory.nebius.com/quickstart) and [AWS Bedrock Mantle](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html).
+- A remote OpenAI-compatible LLM endpoint and key (`LLM_BASE_URL` + `LLM_API_KEY` + `MODEL_ID`). Tested presets: [Nebius Token Factory](https://docs.tokenfactory.nebius.com/quickstart), [AWS Bedrock Mantle](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html), and a self-run [LiteLLM proxy](https://docs.litellm.ai/docs/simple_proxy).
 - A Jina API key: https://jina.ai/api-dashboard/
 - Disk for the CUDA + pytorch base images and job data under `./data` (no model download in remote mode).
 
@@ -214,7 +214,7 @@ The agent talks to one OpenAI-compatible `/v1` endpoint, configured by env:
 | `LLM_THINKING_LEVEL` | `high` (default), `medium`, or `off` - lower for non-reasoning models or for speed. |
 | `LLM_SUPPORTS_DEVELOPER_ROLE` / `LLM_SUPPORTS_REASONING_EFFORT` | `false` by default (safe for OSS models); set `true` for models that support these OpenAI features. |
 
-Two tested presets (uncomment one in `.env`):
+Tested presets (uncomment one in `.env`):
 
 ```bash
 # Nebius Token Factory — https://docs.tokenfactory.nebius.com/quickstart
@@ -226,7 +226,14 @@ MODEL_ID=deepseek-ai/DeepSeek-R1-0528
 # LLM_BASE_URL=https://bedrock-mantle.us-east-1.api.aws/v1   # pick your region
 # LLM_API_KEY=your_bedrock_api_key                            # static bearer key, not AWS SigV4
 # MODEL_ID=openai.gpt-oss-120b
+
+# LiteLLM proxy — https://docs.litellm.ai/docs/simple_proxy   (default port 4000)
+# LLM_BASE_URL=http://your-litellm-host:4000/v1
+# LLM_API_KEY=sk-your_litellm_virtual_or_master_key
+# MODEL_ID=your_model_name   # the model_name ALIAS from LiteLLM's config.yaml, not the upstream id
 ```
+
+For LiteLLM, `MODEL_ID` is the `model_name` you defined in the proxy's `config.yaml` (LiteLLM routes on that alias), not the underlying provider's raw model id. If the proxy fronts a model that supports the OpenAI developer role / `reasoning_effort` (e.g. OpenAI o-series or GPT), set `LLM_SUPPORTS_DEVELOPER_ROLE=true` / `LLM_SUPPORTS_REASONING_EFFORT=true`.
 
 In remote mode the live dashboard's KV-occupancy + tok/s charts (read from llama.cpp `/slots` and `/metrics`) are unavailable; context utilization falls back to Pi's reported usage tokens against `CONTEXT_WINDOW`, and throughput is omitted.
 
