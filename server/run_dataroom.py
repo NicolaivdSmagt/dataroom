@@ -2,7 +2,9 @@
 """Orchestrator: runs the autonomous Pi harness for one dataroom job.
 
 - Boots the per-job index sidecar (jina-embeddings-v5-nano) backing `dataroom_index`.
-- Writes per-job Pi config (models.json -> local Qwen). Jina access is the `jina` CLI on PATH.
+- Writes per-job Pi config (models.json -> an OpenAI-compatible LLM endpoint). The endpoint can
+  be a remote provider (Nebius Token Factory, AWS Bedrock Mantle, ...) or a self-hosted local
+  llama.cpp server. Jina access is the `jina` CLI on PATH.
 - Drives ONE persistent `pi --mode rpc` session over stdin/stdout JSONL: send the initial
   prompt, then after each agent cycle (an `agent_end` event) re-engage with another `prompt`
   if the work is not done, or `abort` when a ceiling trips. Pi keeps the session,
@@ -36,39 +38,91 @@ def free_port() -> int:
     return p
 
 
-def write_pi_config(agent_dir: Path, llama_url: str, jina_key: str, index_url: str):
-    """Per-job, isolated Pi agent dir so default LLM = local Qwen."""
+def resolve_llm_endpoint(env: dict) -> tuple[str, str]:
+    """Resolve (base_url, api_key) for the OpenAI-compatible LLM endpoint from an env mapping.
+
+    Prefers LLM_BASE_URL (full base incl. /v1); falls back to the legacy LLAMA_URL (host:port, to
+    which we append /v1) so a self-hosted llama.cpp config keeps working unchanged. A remote
+    endpoint (LLM_BASE_URL set explicitly) requires MODEL_ID and LLM_API_KEY. Raises ValueError
+    with a user-facing message on any misconfiguration; the caller maps it to an exit.
+    """
+    base_url = (env.get("LLM_BASE_URL") or "").rstrip("/")
+    if not base_url:
+        llama_url = (env.get("LLAMA_URL") or "").rstrip("/")
+        if llama_url:
+            base_url = f"{llama_url}/v1"
+    if not base_url:
+        raise ValueError(
+            "set LLM_BASE_URL (e.g. https://api.tokenfactory.nebius.com/v1) or LLAMA_URL "
+            "(e.g. http://localhost:8080) for a self-hosted llama.cpp")
+    if env.get("LLM_BASE_URL"):
+        if not env.get("MODEL_ID"):
+            raise ValueError(
+                "MODEL_ID required when using a remote LLM_BASE_URL "
+                "(e.g. deepseek-ai/DeepSeek-R1-0528, openai.gpt-oss-120b)")
+        if not env.get("LLM_API_KEY"):
+            raise ValueError("LLM_API_KEY required when using a remote LLM_BASE_URL")
+    return base_url, env.get("LLM_API_KEY") or "sk-local"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var ('1'/'true'/'yes'/'on' => True), defaulting when unset."""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def write_pi_config(agent_dir: Path, base_url: str, api_key: str, jina_key: str, index_url: str):
+    """Per-job, isolated Pi agent dir so the default LLM = our OpenAI-compatible endpoint.
+
+    `base_url` is the full OpenAI-compatible base, INCLUDING the /v1 suffix (e.g.
+    https://api.tokenfactory.nebius.com/v1 or https://bedrock-mantle.<region>.api.aws/v1, or
+    http://llama-server:8080/v1 for a self-hosted llama.cpp). `api_key` is the bearer token.
+    """
     agent_dir.mkdir(parents=True, exist_ok=True)
-    # Context window = the llama-server --ctx-size (default 131072, Qwen3.6 native max).
-    # Pi's built-in auto-compaction triggers at ctx > window - reserveTokens; keepRecentTokens
-    # of recent context survives and older turns become an LLM summary. We scale reserve/keep
-    # with the window so we never overflow and don't compact prematurely. In rpc mode this all
-    # happens inside the single long-lived session.
+    # Context window for compaction math. Set CONTEXT_WINDOW (or CTX_SIZE) to the SERVED model's
+    # window: for a self-hosted llama.cpp this is its --ctx-size; for a remote provider it is that
+    # model's max context. Pi's built-in auto-compaction triggers at ctx > window - reserveTokens;
+    # keepRecentTokens of recent context survives and older turns become an LLM summary. We scale
+    # reserve/keep with the window so we never overflow and don't compact prematurely. In rpc mode
+    # this all happens inside the single long-lived session.
     ctx = int(os.environ.get("CONTEXT_WINDOW", os.environ.get("CTX_SIZE", "131072")))
-    # Agent-facing model id (must agree between models.json and settings.json below).
-    # Free label for llama.cpp's OpenAI endpoint; default qwen3.6 reproduces today exactly.
+    # Agent-facing model id (must agree between models.json and settings.json below). For a remote
+    # provider this is the provider's model name (e.g. deepseek-ai/DeepSeek-R1-0528,
+    # openai.gpt-oss-120b); for a local llama.cpp it is a free label (default qwen3.6).
     model_id = os.environ.get("MODEL_ID", "qwen3.6")
+    # Pi API protocol. openai-completions (/v1/chat/completions) is the default and works for both
+    # Nebius Token Factory and Bedrock Mantle. Set LLM_API=openai-responses to use Mantle's
+    # Responses API instead.
+    api = os.environ.get("LLM_API", "openai-completions")
+    # compat flags: default False/False (safe for llama.cpp and most OSS-model providers). Set the
+    # env vars True for providers/models that support the OpenAI developer role / reasoning-effort.
+    supports_developer_role = _env_bool("LLM_SUPPORTS_DEVELOPER_ROLE", False)
+    supports_reasoning_effort = _env_bool("LLM_SUPPORTS_REASONING_EFFORT", False)
+    # Thinking level: high for best quality (reference MTP tune enables it). Generates reasoning
+    # tokens per cycle (more tokens, slower); set LLM_THINKING_LEVEL=medium/off if throughput or
+    # context suffer, or for non-reasoning models.
+    thinking_level = os.environ.get("LLM_THINKING_LEVEL", "high")
     max_tokens = 8192
     reserve = max(max_tokens + 2048, ctx // 8)   # >= maxTokens, scales with window
     keep_recent = max(16000, ctx // 3)           # healthy recent window survives compaction
-    # default LLM: self-hosted Qwen3.6 (OpenAI-compatible llama.cpp server)
     (agent_dir / "models.json").write_text(json.dumps({
         "providers": {
-            "local": {
-                "baseUrl": f"{llama_url}/v1",
-                "api": "openai-completions",
-                "apiKey": "sk-local",
-                "compat": {"supportsDeveloperRole": False, "supportsReasoningEffort": False},
+            "default": {
+                "baseUrl": base_url,
+                "api": api,
+                "apiKey": api_key,
+                "compat": {"supportsDeveloperRole": supports_developer_role,
+                           "supportsReasoningEffort": supports_reasoning_effort},
                 "models": [{"id": model_id, "contextWindow": ctx, "maxTokens": max_tokens}],
             }
         }
     }, indent=2))
     (agent_dir / "settings.json").write_text(json.dumps({
-        "defaultProvider": "local",
+        "defaultProvider": "default",
         "defaultModel": model_id,
-        # Thinking ON for best quality (reference MTP tune enables it). Generates reasoning
-        # tokens per cycle (more tokens, slower); set "medium"/"off" if throughput/ctx suffer.
-        "defaultThinkingLevel": "high",
+        "defaultThinkingLevel": thinking_level,
         "enableInstallTelemetry": False,
         "compaction": {"enabled": True, "keepRecentTokens": keep_recent,
                        "reserveTokens": reserve},
@@ -414,7 +468,12 @@ def main():
     min_new = int(os.environ.get("MIN_NEW_FILES_PER_TURN", "2"))
     consolidate_every = int(os.environ.get("CONSOLIDATE_EVERY", "4"))   # 0 = off
 
-    llama_url = os.environ.get("LLAMA_URL", "http://localhost:8080")
+    # Resolve the OpenAI-compatible LLM endpoint (remote provider or self-hosted llama.cpp).
+    try:
+        base_url, api_key = resolve_llm_endpoint(os.environ)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr); sys.exit(2)
+
     jina_key = os.environ.get("JINA_API_KEY", "")
     if not jina_key:
         print("ERROR: JINA_API_KEY required", file=sys.stderr); sys.exit(2)
@@ -426,7 +485,7 @@ def main():
     index_port = free_port()
     index_url = f"http://127.0.0.1:{index_port}"
 
-    write_pi_config(agent_dir, llama_url, jina_key, index_url)
+    write_pi_config(agent_dir, base_url, api_key, jina_key, index_url)
     idx = boot_index(job_dir, index_port)
     if not wait_http(f"{index_url}/stats", 120):
         print("ERROR: index sidecar did not come up", file=sys.stderr)

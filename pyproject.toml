@@ -1,0 +1,14 @@
+# ABOUTME: Project metadata + dev tooling (pytest) for the Dataroom-as-a-Service backend.
+# ABOUTME: Runtime deps live in server/requirements.txt; this file wires up the test harness.
+[project]
+name = "dataroom"
+version = "0.1.0"
+description = "Autonomous research harness that builds a fully-cited dataroom for a query."
+requires-python = ">=3.9"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

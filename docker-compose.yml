@@ -1,5 +1,12 @@
 services:
+  # Self-hosted local LLM (OPTIONAL). The default backend is a remote OpenAI-compatible endpoint
+  # (set LLM_BASE_URL/LLM_API_KEY/MODEL_ID in .env), so this GPU container is NOT started by a
+  # plain `docker compose up`. To self-host the model instead, bring it up with its profile:
+  #   docker compose --profile local up -d
+  # and point the app at it by setting LLAMA_URL=http://llama-server:8080 in .env (and unsetting
+  # LLM_BASE_URL).
   llama-server:
+    profiles: ["local"]
     # Pin this. `server-cuda` is a MOVING tag while everything else here is pinned (Pi,
     # adapter, GGUF). The MTP/draft flags below are new and have already changed names once;
     # a silent pull can break startup or drafting determinism. Set LLAMA_IMAGE in .env to an
@@ -64,20 +71,15 @@ services:
     ports:
       - "8000:8000"
     env_file:
+      # .env carries the LLM endpoint config: LLM_BASE_URL + LLM_API_KEY + MODEL_ID (remote,
+      # default) OR LLAMA_URL (self-hosted local). Plus JINA_API_KEY and CONTEXT_WINDOW.
       - .env
     environment:
-      - LLAMA_URL=http://llama-server:8080
       - JOBS_DIR=/data/jobs
-      - CONTEXT_WINDOW=${CTX_SIZE:-131072}   # match llama-server --ctx-size (dashboard + compaction)
-      - EMBED_DEVICE=cpu           # v5-nano on CPU: frees ~0.5GB so Q4 (~22GB) doesn't OOM the L4
+      - EMBED_DEVICE=cpu           # v5-nano on CPU: no GPU needed for the app in remote mode
       - TOKENIZERS_PARALLELISM=false
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # No GPU reservation: in the default remote mode the app needs no GPU (the embedder runs on
+    # CPU). When self-hosting (`--profile local`), the GPU is used by llama-server, not here.
     volumes:
       - ./data:/data
       # Skills + extensions are read-only methodology. Bind them back over the image copy as
@@ -85,8 +87,6 @@ services:
       # touch or delete anything under pi/ - the kernel returns EROFS. Defense in depth on top of
       # the prompt anchor that already tells the agent the dataroom root is its own job dir.
       - ./pi:/app/pi:ro
-    depends_on:
-      - llama-server
     restart: unless-stopped
 
   # Reverse proxy for dataroom.hanxiao.io (Cloudflare -> here). Terminates :80/:443 and

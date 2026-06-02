@@ -1,34 +1,83 @@
-# Reproducible Deploy - Dataroom on a single L4
+# Reproducible Deploy - Dataroom
 
-Everything is pinned and scripted. Two containers: `llama-server` (GPU) and `daas` (GPU app).
+Everything is pinned and scripted. There are two backends:
+- **Remote (default):** one CPU-only `daas` container; the LLM is a remote OpenAI-compatible
+  endpoint (Nebius Token Factory, AWS Bedrock Mantle, ...). No GPU required.
+- **Self-hosted (optional):** add the GPU `llama-server` container under the `local` compose
+  profile and serve the model yourself.
 
 ## 0. Prereqs
-- GCP project with L4 quota (`g2-standard-8`), or any box with an NVIDIA L4 24GB + driver.
+- A Docker host. **No GPU** for the default remote backend; an NVIDIA GPU + driver +
+  `nvidia-container-toolkit` only for the self-hosted backend.
 - A Jina API key: https://jina.ai/api-dashboard/
+- For remote: an OpenAI-compatible endpoint + key (`LLM_BASE_URL` / `LLM_API_KEY` / `MODEL_ID`).
 
-## 1. Create the GPU instance
+## A. Remote backend (default, no GPU)
+
+### 1. Clone + configure
+```bash
+git clone https://github.com/hanxiao/dataroom.git
+cd dataroom
+cp .env.example .env
+sed -i 's/^JINA_API_KEY=.*/JINA_API_KEY=jina_your_real_key/' .env
+# uncomment a preset in .env, or append one — e.g. Nebius Token Factory:
+cat >> .env <<'EOF'
+LLM_BASE_URL=https://api.tokenfactory.nebius.com/v1
+LLM_API_KEY=your_nebius_api_key
+MODEL_ID=deepseek-ai/DeepSeek-R1-0528
+CONTEXT_WINDOW=131072
+EOF
+```
+
+### 2. One-shot setup (Docker + up)
+```bash
+bash scripts/setup.sh
+```
+With `LLM_BASE_URL` set, `setup.sh` skips the GPU preflight and the ~22GB model download, builds
+the `daas` image (pre-baking `jina-embeddings-v5-text-nano`), and starts the app + nginx only.
+
+Endpoint env reference (remote):
+
+| Env var | Role |
+| --- | --- |
+| `LLM_BASE_URL` | Full base URL incl. `/v1`. Setting it selects remote mode. |
+| `LLM_API_KEY` | Bearer token for the endpoint. |
+| `MODEL_ID` | Provider's model name (e.g. `deepseek-ai/DeepSeek-R1-0528`, `openai.gpt-oss-120b`). |
+| `CONTEXT_WINDOW` | Served model's context length; compaction + dashboard denominator (no `/slots` in remote mode). |
+| `LLM_API` | `openai-completions` (default) or `openai-responses` (Bedrock Mantle). |
+| `LLM_THINKING_LEVEL` | `high` (default) / `medium` / `off`. |
+| `LLM_SUPPORTS_DEVELOPER_ROLE`, `LLM_SUPPORTS_REASONING_EFFORT` | `false` default; `true` for models that support them. |
+
+In remote mode the dashboard's KV-occupancy + tok/s charts are unavailable (those read llama.cpp
+`/slots` and `/metrics`); context utilization falls back to Pi's usage tokens vs `CONTEXT_WINDOW`.
+
+## B. Self-hosted backend (NVIDIA L4 24GB)
+
+### 1. Create the GPU instance
 ```bash
 GCP_PROJECT=jinaai-dev ZONE=us-central1-a NAME=daas-l4 bash scripts/create_instance.sh
 gcloud compute ssh daas-l4 --project=jinaai-dev --zone=us-central1-a
 ```
 
-## 2. Clone + configure
+### 2. Clone + configure
 ```bash
-git clone https://github.com/hanxiao/dataroom-as-a-service.git
-cd dataroom-as-a-service
+git clone https://github.com/hanxiao/dataroom.git
+cd dataroom
 cp .env.example .env
-# set ONLY the Jina key (the only value you must set); replace jina_your_real_key
 sed -i 's/^JINA_API_KEY=.*/JINA_API_KEY=jina_your_real_key/' .env
+# select the local backend: leave LLM_BASE_URL unset, point the app at the GPU container
+echo 'LLAMA_URL=http://llama-server:8080' >> .env
 ```
 
-## 3. One-shot setup (Docker + NVIDIA toolkit + model + up)
+### 3. One-shot setup (Docker + NVIDIA toolkit + model + up)
 ```bash
 bash scripts/setup.sh
 ```
-This downloads `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (~22GB) into `models/`, builds the `daas`
-image (which pre-bakes `jina-embeddings-v5-text-nano`), and starts both containers.
+With `LLAMA_URL` set (and no `LLM_BASE_URL`), `setup.sh` runs the GPU preflight, downloads
+`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` (~22GB) into `models/`, builds the `daas` image, and starts
+both containers under the `local` compose profile (`docker compose --profile local up -d`).
 
-## Switching the model
+## Switching the local model
 With nothing set, the default is byte-for-byte today's Qwen3.6 serving. The model is unified
 behind five env vars (set in `.env`); defaults shown reproduce today exactly.
 
@@ -98,12 +147,14 @@ is rejected and the agent is nudged to keep going. The orchestrator writes `run_
 
 ## How the autonomy works
 - Per job, the orchestrator writes an isolated Pi agent dir (`PI_CODING_AGENT_DIR`) with:
-  - `models.json` -> default model = local Qwen (`http://llama-server:8080/v1`), id `MODEL_ID`
-    (default `qwen3.6`); the same id is written as `settings.json` `defaultModel`
+  - `models.json` -> default provider points at the OpenAI-compatible endpoint resolved from
+    `LLM_BASE_URL` (remote) or `${LLAMA_URL}/v1` (self-hosted), with `apiKey` = `LLM_API_KEY`
+    (default `sk-local` for the local case) and the model id `MODEL_ID`; the same id is written as
+    `settings.json` `defaultModel`
   - (no `mcp.json`) → Jina access is the `jina` CLI on PATH, called from bash; reads JINA_API_KEY from env
-- It then loops `pi --mode json --continue` (the same per-cwd session resumes across process
-  invocations) loading the `dataroom` skill and the `dataroom_index` extension. Qwen drives its
-  own research loop; the orchestrator only enforces the floor/ceiling and zips `dataroom/`.
+- It then drives ONE persistent `pi --mode rpc` session (re-nudged after each agent cycle) loading
+  the `dataroom` skill and the `dataroom_index` extension. The model drives its own research loop;
+  the orchestrator only enforces the floor/ceiling and zips `dataroom/`.
 
 ## Updating Pi / pinning llama.cpp
 Pi is pinned via `PI_VERSION` in the Dockerfile (bump + `docker compose build daas`). Pin the

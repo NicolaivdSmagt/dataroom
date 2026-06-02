@@ -7,6 +7,7 @@ __pycache__/
 *.pyc
 .venv/
 node_modules/
+uv.lock
 *.zip
 dataroom/.index*
 nginx/certs/

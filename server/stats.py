@@ -15,6 +15,23 @@ from pathlib import Path
 CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", os.environ.get("CTX_SIZE", "131072")))
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://llama-server:8080")
 
+# Backend mode. A remote OpenAI-compatible endpoint (Nebius, Bedrock Mantle, ...) has no
+# llama.cpp /slots or /metrics, so we skip those probes (avoids a per-poll timeout + 404 spam)
+# and fall back to Pi's own usage tokens for context utilization. Default: "remote" unless a
+# self-hosted llama.cpp is configured via LLAMA_URL (and no remote LLM_BASE_URL is set).
+def _llm_backend() -> str:
+    explicit = os.environ.get("LLM_BACKEND")
+    if explicit:
+        return explicit.strip().lower()
+    if os.environ.get("LLM_BASE_URL"):
+        return "remote"
+    if os.environ.get("LLAMA_URL"):
+        return "local"
+    return "remote"
+
+
+LLM_BACKEND = _llm_backend()
+
 # Outcome floor (shared with the orchestrator in run_dataroom.py).
 MIN_FILES = int(os.environ.get("MIN_FILES", "100"))
 MIN_FILE_BYTES = int(os.environ.get("MIN_FILE_BYTES", "500"))
@@ -356,7 +373,10 @@ def parse_pi_log(log_path: Path, job_dir: Path, live: bool = False) -> dict:
     # llama /slots + metrics are GLOBAL to the one shared llama-server, so they reflect THIS job
     # only while it is the actively-running one (single-worker queue). For queued/done/paused jobs
     # use the job's own last usage, so a fresh job reads 0 instead of bleeding the prior job's numbers.
-    kv = llama_kv() if live else {}
+    # llama.cpp /slots + /metrics only exist for a self-hosted local backend. For a remote
+    # endpoint, skip the probes and fall back to Pi's own usage tokens (tok/s is simply omitted).
+    local = LLM_BACKEND == "local"
+    kv = llama_kv() if (live and local) else {}
     window = kv.get("window") or CONTEXT_WINDOW
     ctx_tokens = kv.get("tokens") or pi_tokens
     return {
@@ -375,7 +395,7 @@ def parse_pi_log(log_path: Path, job_dir: Path, live: bool = False) -> dict:
             "percent": round(100 * ctx_tokens / window, 1) if window else 0,
             "processing": kv.get("processing", False),
         },
-        "tps": llama_tps() if live else {},
+        "tps": llama_tps() if (live and local) else {},
     }
 
 
